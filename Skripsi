@@ -1,0 +1,441 @@
+import os
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+from neuralforecast import NeuralForecast
+from neuralforecast.models import PatchTST
+from neuralforecast.losses.pytorch import MSE, RMSE, MAE
+
+from sklearn.metrics import (
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score,
+)
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+
+
+# -----------------------------------------------------
+# 0. KONFIGURASI
+# -----------------------------------------------------
+DATA_PATH = "jakarta_sync_final_merged_REBUILD.csv"
+
+TARGET_COLS = ["pm25", "co", "no2"]
+FREQ = "H"
+
+TRAIN_RATIO = 0.7
+VAL_RATIO = 0.15
+
+CONTEXT_LENGTH = 48
+PRED_LENGTH = 1
+
+
+# -----------------------------------------------------
+# 1. SELECTION — Pemilihan Fitur & Identifikasi Masalah
+# -----------------------------------------------------
+def fix_number_str(x):
+    """Membersihkan angka rusak: 1.234.567 → 1.234567."""
+    if pd.isna(x):
+        return np.nan
+    s = str(x).strip()
+    parts = s.split(".")
+    if len(parts) <= 2:
+        try:
+            return float(s)
+        except ValueError:
+            return np.nan
+    return float(parts[0] + "." + "".join(parts[1:]))
+
+# Load data
+df = pd.read_csv(DATA_PATH)
+print("Kolom awal:", list(df.columns))
+
+# Gabung pasangan *_x / *_y
+pairs = [
+    ("temp_c_x", "temp_c_y", "temp_c"),
+    ("rh_percent_x", "rh_percent_y", "rh_percent"),
+    ("precip_mm_x", "precip_mm_y", "precip_mm"),
+    ("wind_ms_x", "wind_ms_y", "wind_ms"),
+    ("wind_dir_deg_x", "wind_dir_deg_y", "wind_dir_deg"),
+    ("wind_gust_ms_x", "wind_gust_ms_y", "wind_gust_ms"),
+]
+
+for col_x, col_y, final in pairs:
+    if col_y in df.columns:
+        df[final] = df[col_y]
+    elif col_x in df.columns:
+        df[final] = df[col_x]
+    else:
+        df[final] = np.nan
+
+# Drop *_x / *_y
+drop_xy = [x for pair in pairs for x in pair[:2] if x in df.columns]
+df = df.drop(columns=drop_xy)
+
+print("\nKolom setelah buang *_x/*_y:")
+print(list(df.columns))
+
+# -----------------------------------------------------
+# 2. PREPROCESSING — Cleaning, Missing Fix, Temporal Sync
+# -----------------------------------------------------
+# Bersihkan angka rusak
+num_cols_all = [
+    "pm25", "co", "no2",
+    "temp_c", "rh_percent", "precip_mm",
+    "wind_ms", "wind_dir_deg", "wind_gust_ms",
+    "latitude", "longitude",
+    "nearest_location_distance_km",
+]
+
+for col in num_cols_all:
+    if col in df.columns:
+        df[col] = df[col].apply(fix_number_str)
+
+# Parse datetime
+df["datetime"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
+df = df.dropna(subset=["datetime"]).sort_values("datetime")
+
+# Sinkronisasi grid waktu 1 jam
+df = df.set_index("datetime")
+full_idx = pd.date_range(df.index.min(), df.index.max(), freq="1h", tz=df.index.tz)
+df_sync = df.reindex(full_idx)
+
+# Missing handling
+num_cols_main = [
+    "pm25", "co", "no2",
+    "temp_c", "rh_percent", "precip_mm",
+    "wind_ms", "wind_dir_deg", "wind_gust_ms",
+]
+
+df_sync[num_cols_main] = df_sync[num_cols_main].interpolate(method="time", limit=12)
+
+df_sync["month"] = df_sync.index.month
+df_sync["hour"] = df_sync.index.hour
+
+def fill_with_month_hour_mean(df_in, col):
+    g = df_in.groupby(["month", "hour"])[col].transform("mean")
+    return df_in[col].where(~df_in[col].isna(), g)
+
+for col in num_cols_main:
+    df_sync[col] = fill_with_month_hour_mean(df_sync, col)
+
+df_sync[num_cols_main] = df_sync[num_cols_main].ffill().bfill()
+
+# Clamp ekstrem
+df_sync["pm25"] = df_sync["pm25"].clip(0, 600)
+df_sync["no2"] = df_sync["no2"].clip(0, 400)
+df_sync["co"] = df_sync["co"].clip(lower=0)
+
+# Tambah fitur kalender lain
+df_sync["year"] = df_sync.index.year
+df_sync["dayofweek"] = df_sync.index.dayofweek
+df_sync["is_weekend"] = df_sync["dayofweek"].isin([5, 6]).astype(int)
+
+print("\nCek missing setelah imputasi utama:")
+print(df_sync[num_cols_main].isna().sum())
+# Simpan versi prepro (opsional)
+df_prepro = df_sync.copy()
+
+# =====================================================
+# C. KDD — TRANSFORMATION (Scaling numerik saja)
+# =====================================================
+
+df_sync["year"] = df_sync.index.year
+df_sync["dayofweek"] = df_sync.index.dayofweek
+df_sync["is_weekend"] = df_sync["dayofweek"].isin([5, 6]).astype(int)
+
+# Simpan preprocessed data
+df_prepro = df_sync.copy()
+df_prepro_reset = df_prepro.reset_index().rename(columns={"index": "datetime"})
+df_prepro_reset.to_csv("jakarta_sync_final_for_patchtst.csv", index=False)
+
+# -----------------------------------------------------
+# 4. EDA VISUAL — BERBASIS df_prepro
+# -----------------------------------------------------
+def run_eda(df_raw, df_prepro):
+    """Kumpulan grafik EDA utama."""
+    print("\n=== EDA: Visualisasi ===")
+
+    # 4.1 Time-series multi polutan
+    plt.figure(figsize=(14,5))
+    plt.plot(df_prepro.index, df_prepro["pm25"], label="PM2.5", alpha=0.8)
+    plt.plot(df_prepro.index, df_prepro["no2"], label="NO₂", alpha=0.8)
+    plt.plot(df_prepro.index, df_prepro["co"],  label="CO",   alpha=0.8)
+    plt.title("Tren Polutan Jakarta (PM2.5 / NO₂ / CO)")
+    plt.xlabel("Tanggal")
+    plt.ylabel("Konsentrasi (satuan asli)")
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # 4.2 Pola harian (diurnal pattern)
+    df_tmp = df_prepro.copy()
+    df_tmp["hour"] = df_tmp.index.hour
+    hourly = df_tmp.groupby("hour")[["pm25","no2","co"]].mean()
+
+    plt.figure(figsize=(10,4))
+    hourly.plot(ax=plt.gca())
+    plt.title("Pola Harian Rata-rata Polutan")
+    plt.xlabel("Jam")
+    plt.ylabel("Konsentrasi rata-rata")
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # 4.3 Heatmap bulanan (bulan vs polutan)
+    df_tmp["month"] = df_tmp.index.month
+    pivot = df_tmp.pivot_table(index="month", values=["pm25","no2","co"], aggfunc="mean")
+
+    plt.figure(figsize=(6,4))
+    sns.heatmap(pivot, annot=True, cmap="coolwarm", fmt=".1f")
+    plt.title("Rata-Rata Bulanan Polutan")
+    plt.tight_layout()
+    plt.show()
+
+    # 4.4 Boxplot per tahun (PM2.5)
+    df_tmp["year"] = df_tmp.index.year
+    plt.figure(figsize=(12,4))
+    sns.boxplot(data=df_tmp, x="year", y="pm25")
+    plt.title("Distribusi Tahunan PM2.5")
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+
+    # 4.5 Korelasi fitur utama (polutan + cuaca)
+    eda_cols = [
+        "pm25", "co", "no2",
+        "temp_c", "rh_percent", "precip_mm",
+        "wind_ms", "wind_dir_deg", "wind_gust_ms",
+    ]
+    eda_cols_exist = [c for c in eda_cols if c in df_prepro.columns]
+    df_eda = df_prepro[eda_cols_exist].copy()
+
+    plt.figure(figsize=(10,8))
+    sns.heatmap(df_eda.corr(), annot=True, cmap="coolwarm", fmt=".2f")
+    plt.title("Heatmap Korelasi Fitur (Polutan & Meteorologi)")
+    plt.tight_layout()
+    plt.show()
+
+    print("\n✓ EDA visual selesai.")
+
+
+run_eda(df, df_prepro)
+
+# -----------------------------------------------------
+# 4. DATA MINING — Melatih PatchTST Per Polutan
+# -----------------------------------------------------
+def train_patchtst_univariate(df_pp, target):
+    """PatchTST univariate dengan RevIN dan satuan asli."""
+    series = (
+        df_pp[[target]]
+        .reset_index()
+        .rename(columns={"index": "ds", target: "y"})
+    )
+    series["unique_id"] = target
+
+    n_total = len(series)
+    train_size = int(n_total * TRAIN_RATIO)
+    val_size = int(n_total * VAL_RATIO)
+    test_size = n_total - train_size - val_size
+
+    print(f"\n=== TRAIN PATCHTST [{target.upper()}] ===")
+
+    model = PatchTST(
+        h=PRED_LENGTH,
+        input_size=CONTEXT_LENGTH,
+        patch_len=16,
+        stride=8,
+        encoder_layers=3,
+        n_heads=8,
+        hidden_size=128,
+        linear_hidden_size=256,
+        dropout=0.1,
+        attn_dropout=0.1,
+        fc_dropout=0.1,
+        head_dropout=0.1,
+        revin=True,
+        loss=MSE(),          # Training pakai MSE
+        valid_loss=RMSE(),   # Validasi pakai RMSE
+        max_steps=1500,
+        learning_rate=1e-3,
+        batch_size=32,
+        windows_batch_size=512,
+        scaler_type="identity",
+    )
+
+    nf = NeuralForecast(models=[model], freq=FREQ)
+
+    yhat = nf.cross_validation(
+        df=series,
+        val_size=val_size,
+        test_size=test_size,
+        n_windows=None,
+    )
+
+    # -------------------------------------------------
+    # 5. EVALUATION — RMSE, MAE, R²
+    # -------------------------------------------------
+    y_true = yhat["y"].values
+    y_pred = yhat["PatchTST"].values
+
+    # MSE tanpa argumen squared=
+    mse  = mean_squared_error(y_true, y_pred)
+    rmse = np.sqrt(mse)                     # RMSE manual
+    mae  = mean_absolute_error(y_true, y_pred)
+    r2   = r2_score(y_true, y_pred)
+
+
+    print(f"RMSE={rmse:.3f}  MAE={mae:.3f}  R²={r2:.3f}")
+
+    # ---- Plot 1: Prediksi vs Aktual (time series) ----
+    plt.figure(figsize=(14,4))
+    plt.plot(yhat["ds"], y_true, label="Aktual", linewidth=1.2)
+    plt.plot(yhat["ds"], y_pred, label="Prediksi PatchTST", linewidth=1.2)
+    plt.title(f"Prediksi vs Aktual PatchTST — {target.upper()}")
+    plt.xlabel("Waktu")
+    plt.ylabel("Konsentrasi (satuan asli)")
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    # ---- Plot 2: Scatter y_true vs y_pred ----
+    plt.figure(figsize=(5,5))
+    plt.scatter(y_true, y_pred, alpha=0.4, s=10)
+    min_v = min(y_true.min(), y_pred.min())
+    max_v = max(y_true.max(), y_pred.max())
+    plt.plot([min_v, max_v], [min_v, max_v], 'r--', label="y = x")
+    plt.xlabel("Aktual")
+    plt.ylabel("Prediksi")
+    plt.title(f"Scatter Aktual vs Prediksi — {target.upper()}")
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # ---- Plot 3: Histogram residual ----
+    resid = y_true - y_pred
+    plt.figure(figsize=(8,4))
+    plt.hist(resid, bins=50, alpha=0.7)
+    plt.title(f"Distribusi Residual — {target.upper()}")
+    plt.xlabel("Residual (y_true - y_pred)")
+    plt.ylabel("Frekuensi")
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    return {"target": target.upper(), "RMSE": rmse, "MAE": mae, "R²": r2}
+
+
+# Jalankan training & evaluasi untuk tiap polutan
+df_pp = df_prepro.copy()
+
+all_results = []
+for pol in TARGET_COLS:
+    res = train_patchtst_univariate(df_pp, pol)
+    all_results.append(res)
+
+results_df = pd.DataFrame(all_results)
+print("\n=== RINGKASAN HASIL PATCHTST (PER POLUTAN) ===")
+print(results_df)
+
+import pandas as pd
+import folium
+import numpy as np
+from branca.colormap import linear
+
+# ============================================
+# 1) LOAD DATA RAW MEASUREMENTS OPENAQ
+# ============================================
+MEAS_PATH = "measurements_jakarta_pm25_no2_co_long.csv"
+
+df = pd.read_csv(MEAS_PATH)
+
+# Pastikan nama kolom sesuai (sesuaikan kalau beda)
+# Asumsi kolom: datetime, parameter, value, latitude, longitude, location_id, name
+print("Kolom measurements:", df.columns.tolist())
+
+# Filter hanya PM2.5 dan baris yang punya koordinat+value
+df_pm25 = df[df["parameter"].str.lower() == "pm25"].copy()
+df_pm25 = df_pm25.dropna(subset=["latitude", "longitude", "value"])
+
+# ============================================
+# 2) AGREGASI: RATA-RATA PM2.5 PER LOKASI SENSOR
+# ============================================
+# Jadi setiap titik di peta = 1 lokasi sensor
+agg = (
+    df_pm25
+    .groupby("location_id")
+    .agg(
+        mean_pm25=("value", "mean"),
+        max_pm25=("value", "max"),
+        n_obs=("value", "count"),
+        lat=("latitude", "first"),
+        lon=("longitude", "first"),
+        name=("name", "first"),
+    )
+    .reset_index()
+)
+
+print("Jumlah lokasi sensor PM2.5:", agg.shape[0])
+print(agg.head())
+
+# ============================================
+# 3) BUAT PETA FOLIUM
+# ============================================
+# Pusatkan di Jakarta (Monas)
+center_lat, center_lon = -6.1754, 106.8272
+
+m = folium.Map(
+    location=[center_lat, center_lon],
+    zoom_start=10,
+    tiles="CartoDB dark_matter"  # biar nuansanya mirip dashboard
+)
+
+# Colormap berdasarkan mean_pm25
+colormap = linear.YlOrRd_09.scale(agg["mean_pm25"].min(), agg["mean_pm25"].max())
+colormap.caption = "Rata-rata PM2.5 (µg/m³)"
+
+# Normalisasi ukuran titik
+min_pm, max_pm = agg["mean_pm25"].min(), agg["mean_pm25"].max()
+def scale_radius(v, vmin=min_pm, vmax=max_pm, rmin=4, rmax=18):
+    if np.isnan(v):
+        return rmin
+    if vmax == vmin:
+        return (rmin + rmax) / 2
+    return rmin + (v - vmin) / (vmax - vmin) * (rmax - rmin)
+
+# Tambah marker per sensor
+for _, row in agg.iterrows():
+    pm = row["mean_pm25"]
+    popup_html = (
+        f"<b>Lokasi:</b> {row['name']}<br>"
+        f"<b>Location ID:</b> {row['location_id']}<br>"
+        f"<b>Rata-rata PM2.5:</b> {pm:.2f} µg/m³<br>"
+        f"<b>Maksimum PM2.5:</b> {row['max_pm25']:.2f} µg/m³<br>"
+        f"<b>Jumlah pengamatan:</b> {row['n_obs']}"
+    )
+
+    folium.CircleMarker(
+        location=[row["lat"], row["lon"]],
+        radius=scale_radius(pm),
+        color=None,
+        fill=True,
+        fill_color=colormap(pm),
+        fill_opacity=0.8,
+        popup=folium.Popup(popup_html, max_width=300),
+    ).add_to(m)
+
+colormap.add_to(m)
+
+# ============================================
+# 4) SIMPAN PETA KE HTML
+# ============================================
+m.save("peta_persebaran_pm25_jakarta.html")
+print("Peta disimpan sebagai: peta_persebaran_pm25_jakarta.html")
